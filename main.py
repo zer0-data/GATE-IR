@@ -316,20 +316,155 @@ def demo_pipeline():
 
 
 def inference(image_path: str, output_path: Optional[str] = None):
-    """Run inference on a single image."""
+    """
+    Run inference on a single thermal image.
+    
+    Data Flow:
+        1. Load 14-bit RAW thermal image (Integer, 0-16383)
+        2. WeatherGate classification (handles raw input, is_normalized=False)
+        3. Normalize to [0, 1] Float
+        4. WeatherRouter preprocessing (expects [0, 1], is_normalized=True)
+        5. YOLO detection (expects [0, 1] Float)
+    
+    Args:
+        image_path: Path to 14-bit thermal image (PNG/TIFF)
+        output_path: Optional path to save results
+    """
     print(f"Running inference on: {image_path}")
     
-    # This is a placeholder - in practice, you would:
-    # 1. Load the image
-    # 2. Preprocess to 14-bit format
-    # 3. Run through the pipeline
-    # 4. Post-process detections
-    # 5. Save/visualize results
+    # Check if image exists
+    if not os.path.exists(image_path):
+        print(f"Error: Image not found: {image_path}")
+        return
     
-    print("Inference mode requires trained model weights.")
-    print("Please train the models first using:")
-    print("  1. python training/train_cyclegan.py")
-    print("  2. python training/train_distillation.py")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # =========================================================================
+    # Step 1: Load 14-bit RAW thermal image
+    # =========================================================================
+    print("\n1. Loading thermal image...")
+    
+    try:
+        import cv2
+        import numpy as np
+        
+        # Load as 16-bit to preserve 14-bit data (UNCHANGED prevents 8-bit conversion)
+        thermal_raw = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        
+        if thermal_raw is None:
+            print(f"Error: Could not load image: {image_path}")
+            return
+        
+        # Handle different input formats
+        if thermal_raw.ndim == 3:
+            # Convert BGR to grayscale if needed
+            thermal_raw = cv2.cvtColor(thermal_raw, cv2.COLOR_BGR2GRAY)
+        
+        print(f"   Raw image shape: {thermal_raw.shape}")
+        print(f"   Raw dtype: {thermal_raw.dtype}")
+        print(f"   Raw value range: [{thermal_raw.min()}, {thermal_raw.max()}]")
+        
+        # Convert to torch tensor (keep as integer for now)
+        # Shape: (1, 1, H, W) - batch, channel, height, width
+        thermal_tensor = torch.from_numpy(thermal_raw.astype(np.float32))
+        thermal_tensor = thermal_tensor.unsqueeze(0).unsqueeze(0)
+        thermal_tensor = thermal_tensor.to(device)
+        
+    except ImportError:
+        print("Warning: OpenCV not available, using synthetic data")
+        # Create synthetic 14-bit thermal data for demonstration
+        thermal_tensor = torch.randint(0, 16384, (1, 1, 480, 640), 
+                                        dtype=torch.float32, device=device)
+    
+    print(f"   Tensor shape: {thermal_tensor.shape}")
+    
+    # =========================================================================
+    # Step 2: WeatherGate Classification (handles raw 14-bit input)
+    # =========================================================================
+    print("\n2. Stage A: Weather Classification...")
+    
+    from gate.weather_gate import WeatherGate
+    
+    gate = WeatherGate().to(device).eval()
+    
+    with torch.no_grad():
+        # Pass raw 14-bit data with is_normalized=False
+        # WeatherGate will normalize internally
+        class_ids, probs = gate(thermal_tensor, return_probs=True, is_normalized=False)
+    
+    class_name = gate.get_class_name(class_ids[0].item())
+    confidence = probs[0, class_ids[0]].item()
+    print(f"   Weather: {class_name} (confidence: {confidence:.2%})")
+    
+    # =========================================================================
+    # Step 3: Normalize to [0, 1] Float
+    # =========================================================================
+    print("\n3. Normalizing to [0, 1]...")
+    
+    # 14-bit max value = 16383 (2^14 - 1)
+    MAX_14BIT = 16383.0
+    thermal_normalized = thermal_tensor / MAX_14BIT
+    
+    print(f"   Normalized range: [{thermal_normalized.min():.4f}, {thermal_normalized.max():.4f}]")
+    
+    # =========================================================================
+    # Step 4: WeatherRouter Preprocessing (expects [0, 1])
+    # =========================================================================
+    print("\n4. Stage B: Weather-Specific Preprocessing...")
+    
+    from preprocessing.weather_router import WeatherRouter
+    
+    router = WeatherRouter().to(device).eval()
+    
+    with torch.no_grad():
+        # Input is already normalized, pass is_normalized=True
+        processed = router(thermal_normalized, class_ids, is_normalized=True)
+    
+    print(f"   Preprocessor: {router.CLASS_NAMES.get(class_ids[0].item(), 'Unknown')}")
+    print(f"   Output range: [{processed.min():.4f}, {processed.max():.4f}]")
+    
+    # =========================================================================
+    # Step 5: YOLO Detection (expects [0, 1] Float)
+    # =========================================================================
+    print("\n5. Stage C: Object Detection...")
+    
+    from models.yolov8_thermal import yolov8s_thermal
+    
+    # Resize to 640x640 for YOLO
+    import torch.nn.functional as F
+    if processed.shape[2:] != (640, 640):
+        processed = F.interpolate(processed, size=(640, 640), mode='bilinear', align_corners=False)
+        print(f"   Resized to: {processed.shape}")
+    
+    detector = yolov8s_thermal(num_classes=3, include_p2=True).to(device).eval()
+    
+    with torch.no_grad():
+        detections = detector(processed)
+    
+    print(f"   Detection scales: {list(detections['predictions'].keys())}")
+    for scale, preds in detections['predictions'].items():
+        H, W = preds['cls'].shape[2:]
+        print(f"     {scale}: {H}x{W} grid, {preds['cls'].shape[1]} classes")
+    
+    # =========================================================================
+    # Post-processing (placeholder)
+    # =========================================================================
+    print("\n6. Post-processing...")
+    print("   Note: NMS and box decoding require trained model weights.")
+    print("   Detection output contains raw predictions.")
+    
+    if output_path:
+        print(f"\n7. Saving results to: {output_path}")
+        # In practice, save visualized detections here
+    
+    print("\n" + "=" * 70)
+    print("Inference Complete!")
+    print("=" * 70)
+    print("\nNote: For actual detection results, please:")
+    print("  1. Train the models using training scripts")
+    print("  2. Load trained weights before inference")
+    print("  3. Implement NMS and box decoding for final detections")
 
 
 def main():

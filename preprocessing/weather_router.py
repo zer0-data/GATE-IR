@@ -208,7 +208,8 @@ class WeatherRouter(nn.Module):
     def route_batch_heterogeneous(
         self,
         images: torch.Tensor,
-        class_ids: torch.Tensor
+        class_ids: torch.Tensor,
+        is_normalized: Optional[bool] = None
     ) -> torch.Tensor:
         """
         Route batch with mixed weather conditions (per-image).
@@ -216,6 +217,7 @@ class WeatherRouter(nn.Module):
         Args:
             images: Batch of thermal images (B, 1, H, W)
             class_ids: Per-image class IDs, shape (B,)
+            is_normalized: Whether input is already normalized to [0, 1]
         
         Returns:
             Preprocessed batch
@@ -227,7 +229,7 @@ class WeatherRouter(nn.Module):
             image = images[i:i+1]  # Keep batch dim
             class_id = class_ids[i].item()
             
-            processed = self.route_batch_homogeneous(image, class_id)
+            processed = self.route_batch_homogeneous(image, class_id, is_normalized=is_normalized)
             results.append(processed)
         
         return torch.cat(results, dim=0)
@@ -235,7 +237,8 @@ class WeatherRouter(nn.Module):
     def route_batch_optimized(
         self,
         images: torch.Tensor,
-        class_ids: torch.Tensor
+        class_ids: torch.Tensor,
+        is_normalized: Optional[bool] = None
     ) -> torch.Tensor:
         """
         Optimized batch routing using masked operations.
@@ -246,6 +249,7 @@ class WeatherRouter(nn.Module):
         Args:
             images: Batch of thermal images (B, 1, H, W)
             class_ids: Per-image class IDs, shape (B,)
+            is_normalized: Whether input is already normalized to [0, 1]
         
         Returns:
             Preprocessed batch
@@ -268,7 +272,7 @@ class WeatherRouter(nn.Module):
             
             # Extract and process
             class_images = images[indices]
-            processed = self.route_batch_homogeneous(class_images, class_id)
+            processed = self.route_batch_homogeneous(class_images, class_id, is_normalized=is_normalized)
             
             # Place results back
             output[indices] = processed
@@ -279,7 +283,8 @@ class WeatherRouter(nn.Module):
         self,
         images: torch.Tensor,
         class_ids: Union[torch.Tensor, int],
-        optimize: bool = True
+        optimize: bool = True,
+        is_normalized: Optional[bool] = None
     ) -> torch.Tensor:
         """
         Route images through weather-specific preprocessing.
@@ -288,6 +293,8 @@ class WeatherRouter(nn.Module):
             images: Batch of thermal images (B, 1, H, W) or (B, H, W)
             class_ids: Weather class(es) - single int or tensor of shape (B,)
             optimize: Use optimized batched routing
+            is_normalized: Whether input is already normalized to [0, 1]
+                          True=normalized, False=raw, None=infer from values
         
         Returns:
             Preprocessed images
@@ -300,16 +307,16 @@ class WeatherRouter(nn.Module):
         
         # Handle single class_id for entire batch
         if isinstance(class_ids, int):
-            result = self.route_batch_homogeneous(images, class_ids)
+            result = self.route_batch_homogeneous(images, class_ids, is_normalized=is_normalized)
         elif isinstance(class_ids, torch.Tensor):
             # Check if all same class
             unique_classes = torch.unique(class_ids)
             if len(unique_classes) == 1:
-                result = self.route_batch_homogeneous(images, unique_classes[0].item())
+                result = self.route_batch_homogeneous(images, unique_classes[0].item(), is_normalized=is_normalized)
             elif optimize:
-                result = self.route_batch_optimized(images, class_ids)
+                result = self.route_batch_optimized(images, class_ids, is_normalized=is_normalized)
             else:
-                result = self.route_batch_heterogeneous(images, class_ids)
+                result = self.route_batch_heterogeneous(images, class_ids, is_normalized=is_normalized)
         else:
             raise TypeError(f"class_ids must be int or Tensor, got {type(class_ids)}")
         
