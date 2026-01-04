@@ -247,7 +247,9 @@ class TransformerNeck(nn.Module):
         num_heads: int = 8,
         num_blocks: int = 1,
         mlp_ratio: float = 4.0,
-        drop: float = 0.0
+        drop: float = 0.0,
+        max_resolution: int = 128,
+        learnable_pos_embed: bool = False
     ):
         """
         Initialize TransformerNeck.
@@ -259,11 +261,15 @@ class TransformerNeck(nn.Module):
             num_blocks: Number of transformer blocks
             mlp_ratio: MLP hidden dimension ratio
             drop: Dropout rate
+            max_resolution: Maximum feature map resolution (for pos embed reservoir)
+            learnable_pos_embed: If True, use learnable embeddings (else sinusoidal)
         """
         super().__init__()
         
         self.in_channels = in_channels
         self.embed_dim = embed_dim or in_channels
+        self.max_resolution = max_resolution
+        self.learnable_pos_embed = learnable_pos_embed
         
         # Project to embedding dimension if different
         if self.embed_dim != in_channels:
@@ -282,38 +288,76 @@ class TransformerNeck(nn.Module):
             for _ in range(num_blocks)
         ])
         
-        # Learnable position encoding (will be resized as needed)
-        self.register_buffer('pos_embed', None)
+        # Create positional embedding reservoir at max resolution
+        # This is created ONCE and interpolated for smaller inputs
+        if learnable_pos_embed:
+            # Learnable positional embeddings (preserved during multi-scale training)
+            self.pos_embed_reservoir = nn.Parameter(
+                torch.zeros(1, max_resolution * max_resolution, self.embed_dim)
+            )
+            nn.init.trunc_normal_(self.pos_embed_reservoir, std=0.02)
+        else:
+            # Fixed sinusoidal embeddings (also stored at max resolution)
+            pos_embed = self._create_2d_sincos_pos_embed(
+                self.embed_dim, max_resolution, max_resolution
+            )
+            self.register_buffer('pos_embed_reservoir', pos_embed)
     
     def get_pos_embed(self, H: int, W: int, device: torch.device) -> torch.Tensor:
-        """Generate or retrieve positional embeddings."""
+        """
+        Get positional embeddings for given resolution via interpolation.
+        
+        Instead of regenerating embeddings, this interpolates from the
+        pre-computed reservoir, preserving learned weights during multi-scale training.
+        
+        Args:
+            H: Feature map height
+            W: Feature map width
+            device: Target device
+        
+        Returns:
+            Position embeddings of shape (1, H*W, embed_dim)
+        """
         N = H * W
+        max_N = self.max_resolution * self.max_resolution
         
-        # Generate 2D sinusoidal position encoding
-        if self.pos_embed is None or self.pos_embed.shape[1] != N:
-            pos_embed = self._create_2d_sincos_pos_embed(
-                self.embed_dim, H, W, device
-            )
-            self.pos_embed = pos_embed
+        # If same as reservoir, return directly
+        if H == self.max_resolution and W == self.max_resolution:
+            return self.pos_embed_reservoir.to(device)
         
-        return self.pos_embed
+        # Reshape reservoir to 2D grid: (1, max_H*max_W, C) -> (1, C, max_H, max_W)
+        pos_embed_2d = self.pos_embed_reservoir.transpose(1, 2).reshape(
+            1, self.embed_dim, self.max_resolution, self.max_resolution
+        )
+        
+        # Interpolate to target resolution
+        pos_embed_resized = F.interpolate(
+            pos_embed_2d,
+            size=(H, W),
+            mode='bicubic',
+            align_corners=False
+        )
+        
+        # Reshape back: (1, C, H, W) -> (1, H*W, C)
+        pos_embed = pos_embed_resized.reshape(1, self.embed_dim, N).transpose(1, 2)
+        
+        return pos_embed
     
     def _create_2d_sincos_pos_embed(
         self,
         embed_dim: int,
         h: int,
-        w: int,
-        device: torch.device
+        w: int
     ) -> torch.Tensor:
         """Create 2D sinusoidal positional embeddings."""
-        grid_h = torch.arange(h, device=device, dtype=torch.float32)
-        grid_w = torch.arange(w, device=device, dtype=torch.float32)
+        grid_h = torch.arange(h, dtype=torch.float32)
+        grid_w = torch.arange(w, dtype=torch.float32)
         grid = torch.meshgrid(grid_h, grid_w, indexing='ij')
         grid = torch.stack(grid, dim=0).reshape(2, -1)
         
         # Compute sinusoidal embeddings
         dim_half = embed_dim // 4
-        omega = torch.arange(dim_half, device=device, dtype=torch.float32)
+        omega = torch.arange(dim_half, dtype=torch.float32)
         omega = 1.0 / (10000 ** (omega / dim_half))
         
         out_h = grid[0:1].T @ omega.unsqueeze(0)

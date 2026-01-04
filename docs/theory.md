@@ -199,14 +199,19 @@ Where $\gamma$ controls the curve:
 - $\gamma > 1$: Darkens bright regions (highlights)
 
 **Adaptive Gamma for Fog:**
-$$\gamma = \gamma_{base} - k \cdot (\mu - \mu_{target})$$
+$$\gamma = \gamma_{base} + k \cdot (\mu - \mu_{target})$$
 
 Where:
 - $\mu$ = Mean intensity of input
 - $\mu_{target}$ = Desired mean (e.g., 0.5 for normalized)
 - $k$ = Adaptation rate
 
-**Rationale:** Fog reduces contrast and shifts distribution toward lower values. Adaptive gamma restores dynamic range.
+**Example Calculation:**
+- Dark foggy image: $\mu = 0.2$, $\mu_{target} = 0.5$, $k = 2.0$
+- $\gamma = 1.0 + 2.0 \times (0.2 - 0.5) = 1.0 - 0.6 = 0.4$
+- Since $\gamma < 1$, the image is **brightened** (correct behavior)
+
+**Rationale:** Fog reduces contrast and shifts distribution toward lower values. Adaptive gamma with $\gamma < 1$ restores dynamic range by lifting shadows.
 
 ### 4.2 Rain Removal: LSRB Architecture
 
@@ -271,6 +276,34 @@ $$s = T(r) = (L-1) \int_0^r p_r(w) dw$$
 ```
 
 **Clip Limit**: Prevents noise amplification in uniform regions.
+
+### 4.4 Local Contrast Normalization (LCN)
+
+**Problem with Tiled CLAHE:** The PyTorch implementation requires nested loops over tiles, resulting in O(B × tiles²) complexity—512 sequential operations for batch=8 with 8×8 grid.
+
+**Solution:** Replace with **Local Contrast Normalization**, a fully vectorized operation:
+
+$$I_{out} = \sigma\left(\frac{I - \mu_{local}}{\sigma_{local} + \epsilon}\right)$$
+
+Where:
+- $\mu_{local}$ = Local mean (computed via convolution with uniform kernel)
+- $\sigma_{local}$ = Local standard deviation
+- $\sigma(\cdot)$ = Sigmoid for bounded output
+
+**Implementation (GPU-vectorized):**
+```python
+local_mean = F.conv2d(x, mean_kernel, padding=k//2)
+local_sq_mean = F.conv2d(x**2, mean_kernel, padding=k//2)
+local_std = sqrt(local_sq_mean - local_mean**2 + epsilon)
+output = sigmoid((x - local_mean) / local_std)
+```
+
+**Performance Comparison:**
+
+| Method | Operations/Batch | GPU-friendly | Differentiable |
+|--------|------------------|--------------|----------------|
+| Tiled CLAHE | O(B × tiles²) | ❌ Slow loops | ❌ Uses histc |
+| **LCN** | O(N) | ✅ Vectorized | ✅ Fully |
 
 ---
 
@@ -466,6 +499,13 @@ Where:
 - $\mathcal{L}_{YOLO}$ = Standard YOLO detection loss (box + class + objectness)
 - $\alpha$ = Distillation weight (typically 0.5 - 2.0)
 
+> [!IMPORTANT]
+> **DFL Decoding Requirement**: YOLOv8 outputs Distribution Focal Loss (DFL) logits
+> with shape $(B, 64, H, W)$ representing probability distributions over 16 bins
+> for each box coordinate. These MUST be decoded to scalar coordinates using
+> `dist2bbox()` before CIoU loss can be computed. Using raw DFL logits directly
+> for geometric IoU calculations produces invalid gradients.
+
 ### 6.4 Why This Works
 
 1. **Teacher sees richer information**: Pseudo-RGB contains color/texture cues
@@ -525,4 +565,7 @@ $$\min_\theta \mathcal{L}_{YOLO} + \alpha\mathcal{L}_{mimic}$$
 
 ---
 
-*Document Version: 1.0 | GATE-IR Thermal Detection System*
+*Document Version: 1.1 | GATE-IR Thermal Detection System*
+
+**Changelog:**
+- v1.1: Fixed gamma formula sign, added LCN section

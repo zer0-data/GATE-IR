@@ -23,10 +23,15 @@ class FogEnhancer(nn.Module):
         I_out = I_in ^ gamma
     
     Where gamma is computed based on the mean intensity:
-        gamma = gamma_base - k * (mean - target_mean)
+        gamma = gamma_base + k * (mean - target_mean)
     
-    - Lower mean → higher gamma → brighten dark foggy regions
-    - Higher mean → lower gamma → reduce over-exposure
+    Gamma correction behavior:
+    - gamma < 1: Brightens the image (shadows lifted)
+    - gamma > 1: Darkens the image (highlights compressed)
+    
+    Therefore:
+    - Lower mean (dark/foggy) → gamma < 1 → brighten
+    - Higher mean (bright) → gamma > 1 → darken
     
     Example:
         >>> enhancer = FogEnhancer()
@@ -78,9 +83,12 @@ class FogEnhancer(nn.Module):
         # Keep dimensions for proper broadcasting
         mean_intensity = image.mean(dim=[1, 2, 3], keepdim=True)
         
-        # Adaptive gamma: lower mean → higher gamma (brighten)
-        # gamma = base - rate * (mean - target)
-        gamma = self.gamma_base - self.adaptation_rate * (mean_intensity - self.target_mean)
+        # Adaptive gamma formula:
+        # gamma = base + rate * (mean - target)
+        # 
+        # Dark image (mean=0.2, target=0.5): gamma = 1.0 + 2.0*(-0.3) = 0.4 → brightens
+        # Bright image (mean=0.8, target=0.5): gamma = 1.0 + 2.0*(0.3) = 1.6 → darkens
+        gamma = self.gamma_base + self.adaptation_rate * (mean_intensity - self.target_mean)
         
         # Clamp to valid range
         gamma = torch.clamp(gamma, self.gamma_min, self.gamma_max)
@@ -199,6 +207,9 @@ class AdaptiveContrastEnhancer(nn.Module):
         """
         Apply percentile-based contrast stretching.
         
+        Uses torch.quantile for O(N) performance instead of O(N log N) sorting.
+        Fully vectorized across batch dimension.
+        
         Args:
             image: Input tensor (B, C, H, W)
         
@@ -206,27 +217,30 @@ class AdaptiveContrastEnhancer(nn.Module):
             Contrast-stretched tensor
         """
         batch_size = image.shape[0]
-        stretched = torch.zeros_like(image)
         
-        for i in range(batch_size):
-            img = image[i]
-            flat = img.flatten()
-            
-            # Compute percentiles
-            sorted_vals, _ = torch.sort(flat)
-            n = len(sorted_vals)
-            low_idx = int(n * self.contrast_percentile / 100)
-            high_idx = int(n * (100 - self.contrast_percentile) / 100)
-            
-            low_val = sorted_vals[low_idx]
-            high_val = sorted_vals[high_idx]
-            
-            # Stretch contrast
-            if high_val > low_val:
-                stretched[i] = (img - low_val) / (high_val - low_val + 1e-8)
-                stretched[i] = torch.clamp(stretched[i], 0, 1)
-            else:
-                stretched[i] = img
+        # Flatten spatial dimensions: (B, C, H, W) -> (B, C*H*W)
+        flat = image.view(batch_size, -1)
+        
+        # Compute percentiles using quantile (much faster than sort)
+        # quantile is O(N) vs O(N log N) for sort
+        low_q = self.contrast_percentile / 100.0
+        high_q = 1.0 - low_q
+        
+        # Vectorized quantile across batch - shape: (B,)
+        low_val = torch.quantile(flat, low_q, dim=1, keepdim=True)
+        high_val = torch.quantile(flat, high_q, dim=1, keepdim=True)
+        
+        # Reshape for broadcasting: (B, 1) -> (B, 1, 1, 1)
+        low_val = low_val.view(batch_size, 1, 1, 1)
+        high_val = high_val.view(batch_size, 1, 1, 1)
+        
+        # Avoid division by zero
+        range_val = high_val - low_val
+        range_val = torch.where(range_val > 0, range_val, torch.ones_like(range_val))
+        
+        # Vectorized contrast stretch
+        stretched = (image - low_val) / range_val
+        stretched = torch.clamp(stretched, 0.0, 1.0)
         
         return stretched
     

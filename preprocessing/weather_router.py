@@ -208,8 +208,9 @@ class WeatherRouter(nn.Module):
         batch_size = images.shape[0]
         device = images.device
         
-        # Create output tensor
-        output = torch.zeros_like(images)
+        # Create output tensor - MUST be float to handle preprocessor outputs
+        # even if input images are integer type (e.g., raw 14-bit as int16)
+        output = torch.zeros_like(images, dtype=torch.float32)
         
         # Process each weather class in batch
         for class_id in [self.CLEAR, self.FOG, self.RAIN]:

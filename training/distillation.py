@@ -613,52 +613,169 @@ def train_distillation(
 
 
 # ==============================================================================
-# Simplified YOLO Loss (Placeholder)
+# YOLO Loss Functions
 # ==============================================================================
 
-class SimplifiedYOLOLoss(nn.Module):
+# Try to import official Ultralytics loss components
+try:
+    from ultralytics.utils.loss import v8DetectionLoss
+    from ultralytics.utils.tal import TaskAlignedAssigner, make_anchors, dist2bbox
+    ULTRALYTICS_AVAILABLE = True
+except ImportError:
+    ULTRALYTICS_AVAILABLE = False
+
+
+class UltralyticsYOLOLoss(nn.Module):
     """
-    Simplified YOLO loss for demonstration.
+    Wrapper for official Ultralytics YOLOv8 detection loss.
     
-    In practice, use the actual YOLO loss from ultralytics or
-    implement the full loss with bbox regression, classification,
-    and objectness components.
+    THIS IS THE ONLY RECOMMENDED LOSS FOR FULL DETECTION TRAINING.
+    
+    Includes all proper loss components with correct DFL decoding:
+    - Box regression with CIoU loss (after DFL decoding)
+    - Classification with BCE + Focal Loss
+    - DFL (Distribution Focal Loss) for precise localization
+    - Task-Aligned Assigner for target matching
+    
+    Why use this:
+    - YOLOv8 outputs DFL distributions (64 channels for 4 coords × 16 bins)
+    - These must be decoded to scalar coordinates before CIoU can be computed
+    - The official loss handles all this complexity correctly
+    """
+    
+    def __init__(self, model, num_classes: int = 80):
+        """
+        Initialize with Ultralytics model for proper loss computation.
+        
+        Args:
+            model: Ultralytics YOLO model instance
+            num_classes: Number of detection classes
+        """
+        super().__init__()
+        
+        if not ULTRALYTICS_AVAILABLE:
+            raise ImportError(
+                "Ultralytics is REQUIRED for proper YOLO loss computation.\n"
+                "The YOLOv8 DFL output format requires proper decoding before CIoU.\n"
+                "Install with: pip install ultralytics"
+            )
+        
+        self.num_classes = num_classes
+        
+        # Create the official loss function
+        self.loss_fn = v8DetectionLoss(model)
+    
+    def forward(self, predictions, targets):
+        """
+        Compute official YOLO loss with proper DFL decoding.
+        
+        Args:
+            predictions: Model predictions (raw from detection head)
+            targets: Ground truth in Ultralytics batch format
+        
+        Returns:
+            Total loss (box + cls + dfl)
+        """
+        return self.loss_fn(predictions, targets)
+
+
+class DistillationOnlyLoss(nn.Module):
+    """
+    Minimal loss for feature-only distillation (no ground truth boxes).
+    
+    Use this when:
+    - You only want feature mimic loss (no detection supervision)
+    - Ultralytics is not available
+    - Targets are not provided
+    
+    This loss only computes objectness BCE as a regularizer.
+    The main training signal should come from FeatureMimicLoss.
+    
+    WARNING: This will NOT train a working detector on its own!
+    It must be combined with FeatureMimicLoss from a teacher model.
     """
     
     def __init__(self, num_classes: int):
         super().__init__()
         self.num_classes = num_classes
-        self.bce = nn.BCEWithLogitsLoss()
-        self.mse = nn.MSELoss()
+        self.bce = nn.BCEWithLogitsLoss(reduction='mean')
     
     def forward(
         self,
         predictions: Dict[str, Dict[str, torch.Tensor]],
-        targets: Dict
+        targets: Optional[Dict] = None
     ) -> torch.Tensor:
         """
-        Compute simplified YOLO loss.
+        Compute minimal objectness loss for regularization.
         
-        Args:
-            predictions: Multi-scale predictions from detection head
-            targets: Ground truth targets
-        
-        Returns:
-            Total loss
+        This is NOT a complete detection loss - it only provides
+        a small regularization signal. The main training comes from
+        feature distillation.
         """
-        total_loss = torch.tensor(0.0, device=next(iter(
-            next(iter(predictions.values())).values()
-        )).device)
+        device = next(iter(next(iter(predictions.values())).values())).device
+        total_loss = torch.tensor(0.0, device=device)
         
-        # For each detection scale
-        for scale, preds in predictions.items():
-            # Objectness loss
-            obj_pred = preds['obj']
-            # In practice, create proper objectness targets
-            obj_target = torch.zeros_like(obj_pred)
-            total_loss = total_loss + self.bce(obj_pred, obj_target)
+        for scale_name, preds in predictions.items():
+            if 'obj' in preds:
+                obj_pred = preds['obj']
+                obj_target = torch.zeros_like(obj_pred)
+                total_loss = total_loss + self.bce(obj_pred, obj_target) * 0.1
         
         return total_loss
+
+
+def create_yolo_loss(
+    num_classes: int,
+    model=None,
+    require_ultralytics: bool = True
+) -> nn.Module:
+    """
+    Factory function to create YOLO loss.
+    
+    IMPORTANT: For proper detection training, Ultralytics is REQUIRED.
+    The YOLOv8 architecture outputs DFL distributions that must be
+    decoded before CIoU loss can be computed.
+    
+    Args:
+        num_classes: Number of detection classes
+        model: Ultralytics YOLO model instance (REQUIRED for detection)
+        require_ultralytics: If True, raise error when Ultralytics unavailable
+    
+    Returns:
+        Loss module
+    
+    Raises:
+        ImportError: If require_ultralytics=True and Ultralytics not available
+    """
+    if ULTRALYTICS_AVAILABLE and model is not None:
+        try:
+            print("✓ Using official Ultralytics v8DetectionLoss (recommended)")
+            return UltralyticsYOLOLoss(model, num_classes)
+        except Exception as e:
+            print(f"Warning: Could not create Ultralytics loss: {e}")
+    
+    if require_ultralytics:
+        raise ImportError(
+            "Ultralytics is REQUIRED for proper YOLOv8 detection loss.\n"
+            "\n"
+            "The YOLOv8 detection head outputs DFL (Distribution Focal Loss)\n"
+            "logits with shape (B, 64, H, W) representing probability\n"
+            "distributions over 16 bins for each of 4 box coordinates.\n"
+            "\n"
+            "These MUST be decoded using dist2bbox() before CIoU can be computed.\n"
+            "A custom implementation without this decoding will produce invalid\n"
+            "gradients and the model will not learn to draw bounding boxes.\n"
+            "\n"
+            "Solutions:\n"
+            "1. pip install ultralytics  (recommended)\n"
+            "2. Use DistillationOnlyLoss with feature mimic (no box supervision)\n"
+            "3. Set require_ultralytics=False for distillation-only mode\n"
+        )
+    
+    print("⚠ WARNING: Using DistillationOnlyLoss - this will NOT train detection!")
+    print("  The model will only learn from feature distillation.")
+    print("  For proper detection training, install ultralytics.")
+    return DistillationOnlyLoss(num_classes=num_classes)
 
 
 # ==============================================================================
@@ -708,7 +825,7 @@ if __name__ == "__main__":
     student = MockModel(1, student_channels)
     teacher = MockModel(3, teacher_channels)
     generator = MockGenerator()
-    yolo_loss = SimplifiedYOLOLoss(num_classes=3)
+    yolo_loss = DistillationOnlyLoss(num_classes=3)  # Feature-only distillation
     
     print("Creating DistillationTrainer...")
     trainer = DistillationTrainer(

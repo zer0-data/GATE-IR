@@ -24,8 +24,17 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
+import numpy as np
 import glob
 from tqdm import tqdm
+
+# Try to import OpenCV for proper 16-bit image loading
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+    print("Warning: OpenCV not available. 16-bit thermal image loading may be limited.")
 
 from cyclegan import (
     CycleGAN,
@@ -40,9 +49,67 @@ from cyclegan import (
 # Dataset Classes
 # ==============================================================================
 
+def load_thermal_image(path: str, bit_depth: int = 14) -> np.ndarray:
+    """
+    Load thermal image preserving full bit depth (14-bit or 16-bit).
+    
+    Args:
+        path: Path to thermal image
+        bit_depth: Expected bit depth (14 or 16)
+    
+    Returns:
+        Numpy array with float32 values normalized to [0, 1]
+    """
+    max_value = (2 ** bit_depth) - 1  # 16383 for 14-bit, 65535 for 16-bit
+    
+    if OPENCV_AVAILABLE:
+        # OpenCV can load 16-bit images properly with IMREAD_UNCHANGED
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        
+        if img is None:
+            raise ValueError(f"Failed to load image: {path}")
+        
+        # Handle different image formats
+        if len(img.shape) == 3:
+            # Convert BGR to grayscale if color
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Convert to float and normalize
+        img = img.astype(np.float32) / max_value
+        
+    else:
+        # PIL fallback - try to load as 16-bit
+        try:
+            pil_img = Image.open(path)
+            
+            # Check if it's a 16-bit image
+            if pil_img.mode == 'I;16' or pil_img.mode == 'I':
+                # 16-bit grayscale
+                img = np.array(pil_img, dtype=np.float32) / max_value
+            elif pil_img.mode == 'I;16B':
+                # 16-bit big-endian
+                img = np.array(pil_img, dtype=np.float32) / max_value
+            else:
+                # Standard 8-bit (with warning)
+                print(f"Warning: Loading {path} as 8-bit. Use OpenCV for 14/16-bit support.")
+                img = np.array(pil_img.convert('L'), dtype=np.float32) / 255.0
+                
+        except Exception as e:
+            raise ValueError(f"Failed to load thermal image {path}: {e}")
+    
+    # Ensure values are in valid range
+    img = np.clip(img, 0.0, 1.0)
+    
+    return img
+
+
 class UnpairedImageDataset(Dataset):
     """
     Dataset for unpaired image-to-image translation.
+    
+    Properly handles 14-bit and 16-bit thermal images using OpenCV
+    to preserve full dynamic range, unlike PIL's 'L' mode which
+    truncates to 8-bit.
     
     Loads images from two domains (IR and RGB) independently.
     """
@@ -54,7 +121,8 @@ class UnpairedImageDataset(Dataset):
         transform_ir: Optional[transforms.Compose] = None,
         transform_rgb: Optional[transforms.Compose] = None,
         img_size: int = 256,
-        max_samples: Optional[int] = None
+        max_samples: Optional[int] = None,
+        ir_bit_depth: int = 14
     ):
         """
         Initialize dataset.
@@ -62,22 +130,32 @@ class UnpairedImageDataset(Dataset):
         Args:
             ir_dir: Directory containing thermal images
             rgb_dir: Directory containing RGB images
-            transform_ir: Transforms for IR images
+            transform_ir: Transforms for IR images (applied AFTER loading)
             transform_rgb: Transforms for RGB images
             img_size: Target image size
             max_samples: Maximum number of samples per domain
+            ir_bit_depth: Bit depth of thermal images (14 or 16)
         """
         self.ir_dir = ir_dir
         self.rgb_dir = rgb_dir
+        self.img_size = img_size
+        self.ir_bit_depth = ir_bit_depth
         
-        # Find all images
-        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']
+        # Find all images (including RAW formats common in thermal)
+        image_extensions = [
+            '*.jpg', '*.jpeg', '*.png', '*.bmp', 
+            '*.tif', '*.tiff',  # Common 16-bit formats
+            '*.raw', '*.bin'    # RAW thermal formats
+        ]
         
         self.ir_paths = []
         self.rgb_paths = []
         
         for ext in image_extensions:
             self.ir_paths.extend(glob.glob(os.path.join(ir_dir, '**', ext), recursive=True))
+        
+        # RGB typically uses standard formats
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
             self.rgb_paths.extend(glob.glob(os.path.join(rgb_dir, '**', ext), recursive=True))
         
         # Limit samples if specified
@@ -85,17 +163,11 @@ class UnpairedImageDataset(Dataset):
             self.ir_paths = self.ir_paths[:max_samples]
             self.rgb_paths = self.rgb_paths[:max_samples]
         
-        # Default transforms
-        if transform_ir is None:
-            self.transform_ir = transforms.Compose([
-                transforms.Resize((img_size, img_size)),
-                transforms.Grayscale(num_output_channels=1),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5])  # Map to [-1, 1]
-            ])
-        else:
-            self.transform_ir = transform_ir
+        # Store custom transforms (applied after loading)
+        self.custom_transform_ir = transform_ir
+        self.custom_transform_rgb = transform_rgb
         
+        # Default RGB transforms
         if transform_rgb is None:
             self.transform_rgb = transforms.Compose([
                 transforms.Resize((img_size, img_size)),
@@ -105,22 +177,50 @@ class UnpairedImageDataset(Dataset):
         else:
             self.transform_rgb = transform_rgb
         
-        print(f"Found {len(self.ir_paths)} IR images and {len(self.rgb_paths)} RGB images")
+        print(f"Found {len(self.ir_paths)} IR images ({ir_bit_depth}-bit) and {len(self.rgb_paths)} RGB images")
+        if not OPENCV_AVAILABLE:
+            print("Warning: OpenCV not available. 14/16-bit thermal loading may be degraded.")
     
     def __len__(self) -> int:
         return max(len(self.ir_paths), len(self.rgb_paths))
+    
+    def _load_and_process_ir(self, path: str) -> torch.Tensor:
+        """Load IR image with proper bit depth handling."""
+        # Load with full bit depth
+        img = load_thermal_image(path, self.ir_bit_depth)
+        
+        # Resize using OpenCV (faster and preserves precision)
+        if OPENCV_AVAILABLE:
+            img = cv2.resize(img, (self.img_size, self.img_size), 
+                           interpolation=cv2.INTER_LINEAR)
+        else:
+            # Fallback: use PIL for resize
+            pil_img = Image.fromarray((img * 255).astype(np.uint8))
+            pil_img = pil_img.resize((self.img_size, self.img_size), Image.BILINEAR)
+            img = np.array(pil_img, dtype=np.float32) / 255.0
+        
+        # Convert to tensor: (H, W) -> (1, H, W)
+        tensor = torch.from_numpy(img).unsqueeze(0).float()
+        
+        # Apply custom transforms if provided
+        if self.custom_transform_ir is not None:
+            tensor = self.custom_transform_ir(tensor)
+        else:
+            # Default: normalize to [-1, 1] for CycleGAN
+            tensor = tensor * 2.0 - 1.0
+        
+        return tensor
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         # Cycle through if one domain is smaller
         ir_idx = idx % len(self.ir_paths)
         rgb_idx = idx % len(self.rgb_paths)
         
-        # Load IR image
+        # Load IR image with proper bit depth
         ir_path = self.ir_paths[ir_idx]
-        ir_img = Image.open(ir_path).convert('L')  # Grayscale
-        ir_tensor = self.transform_ir(ir_img)
+        ir_tensor = self._load_and_process_ir(ir_path)
         
-        # Load RGB image
+        # Load RGB image (standard 8-bit is fine here)
         rgb_path = self.rgb_paths[rgb_idx]
         rgb_img = Image.open(rgb_path).convert('RGB')
         rgb_tensor = self.transform_rgb(rgb_img)

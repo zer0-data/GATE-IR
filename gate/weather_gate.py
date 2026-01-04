@@ -163,7 +163,7 @@ class WeatherGate(nn.Module):
         
         Args:
             flat: Flattened image tensor of shape (B, N) where N = H * W
-                  Values should be normalized to [0, 1]
+                  Values can be raw (0 to max_value) or normalized [0, 1]
         
         Returns:
             Entropy tensor of shape (B,)
@@ -171,8 +171,20 @@ class WeatherGate(nn.Module):
         batch_size = flat.shape[0]
         device = flat.device
         
-        # Clamp values to [0, 1]
-        flat = torch.clamp(flat, 0.0, 1.0)
+        # CRITICAL: Normalize to [0, 1] based on actual data range BEFORE clamping
+        # This prevents raw 14-bit data (0-16383) from being clamped to all 1.0
+        flat_min = flat.amin(dim=1, keepdim=True)
+        flat_max = flat.amax(dim=1, keepdim=True)
+        
+        # Avoid division by zero for constant images
+        flat_range = flat_max - flat_min
+        flat_range = torch.where(flat_range == 0, torch.ones_like(flat_range), flat_range)
+        
+        # Min-max normalize each image to [0, 1]
+        flat_normalized = (flat - flat_min) / flat_range
+        
+        # Now safe to clamp (should already be [0, 1], this is defensive)
+        flat_normalized = torch.clamp(flat_normalized, 0.0, 1.0)
         
         # Compute histogram for each image in batch
         # Using soft binning for differentiability
@@ -181,7 +193,7 @@ class WeatherGate(nn.Module):
         bin_width = 1.0 / self.entropy_bins
         
         # Expand for broadcasting: (B, N, 1) and (1, 1, bins)
-        flat_expanded = flat.unsqueeze(-1)  # (B, N, 1)
+        flat_expanded = flat_normalized.unsqueeze(-1)  # (B, N, 1)
         centers_expanded = bin_centers.view(1, 1, -1)  # (1, 1, bins)
         
         # Soft histogram: count contributions to each bin
