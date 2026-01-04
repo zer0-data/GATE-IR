@@ -97,7 +97,11 @@ class WeatherGate(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
-    def extract_features(self, image: torch.Tensor) -> torch.Tensor:
+    def extract_features(
+        self, 
+        image: torch.Tensor,
+        is_normalized: Optional[bool] = None
+    ) -> torch.Tensor:
         """
         Extract statistical features from thermal images efficiently.
         
@@ -110,7 +114,12 @@ class WeatherGate(nn.Module):
         
         Args:
             image: Batch of thermal images, shape (B, 1, H, W) or (B, H, W)
-                   Values should be in range [0, max_value] for 14-bit
+                   Values should be in range [0, max_value] for 14-bit raw
+                   or [0, 1] for normalized input
+            is_normalized: Explicit flag indicating if input is already normalized to [0, 1].
+                          - True: Input is in [0, 1], no normalization needed
+                          - False: Input is raw (e.g., 14-bit), will be normalized
+                          - None: (deprecated) Infer from data values (max > 1.0 = raw)
         
         Returns:
             Feature tensor of shape (B, 5)
@@ -124,9 +133,17 @@ class WeatherGate(nn.Module):
         
         # Normalize to [0, 1] if needed
         if self.normalize_input:
-            # Handle both 14-bit raw and pre-normalized inputs
-            if image.max() > 1.0:
+            if is_normalized is True:
+                # Explicitly told input is normalized - no action needed
+                pass
+            elif is_normalized is False:
+                # Explicitly told input is raw - normalize it
                 image = image.float() / self.max_value
+            else:
+                # Legacy behavior: infer from data values (deprecated)
+                # This is kept for backwards compatibility but should be avoided
+                if image.max() > 1.0:
+                    image = image.float() / self.max_value
         
         # Flatten spatial dimensions for per-image statistics: (B, H*W)
         flat = image.view(batch_size, -1)
@@ -247,7 +264,8 @@ class WeatherGate(nn.Module):
         self,
         image: torch.Tensor,
         return_probs: bool = False,
-        return_features: bool = False
+        return_features: bool = False,
+        is_normalized: Optional[bool] = None
     ) -> Tuple[torch.Tensor, ...]:
         """
         Classify weather conditions from thermal images.
@@ -256,6 +274,8 @@ class WeatherGate(nn.Module):
             image: Batch of thermal images, shape (B, 1, H, W) or (B, H, W)
             return_probs: If True, also return class probabilities
             return_features: If True, also return extracted features
+            is_normalized: Explicit flag for input normalization state.
+                          True=already [0,1], False=raw 14-bit, None=infer (deprecated)
         
         Returns:
             class_ids: Predicted class indices, shape (B,)
@@ -264,7 +284,7 @@ class WeatherGate(nn.Module):
             features: (optional) Extracted features, shape (B, 5)
         """
         # Extract features
-        features = self.extract_features(image)
+        features = self.extract_features(image, is_normalized=is_normalized)
         
         # Forward through MLP
         logits = self.classifier(features)

@@ -356,8 +356,14 @@ class CycleGAN(nn.Module):
         # Identity loss (optional)
         loss_identity = torch.tensor(0.0, device=device)
         if self.use_identity_loss:
-            # G_IR2RGB should be identity if input is RGB
-            same_RGB = self.G_IR2RGB(real_RGB[:, :1])  # Take first channel
+            # G_IR2RGB should be identity if input is "IR-like"
+            # Convert RGB to grayscale using ITU-R BT.601 weights (approximates luminance)
+            # This is theoretically better than just taking the red channel
+            grayscale_weights = torch.tensor([0.299, 0.587, 0.114], device=device)
+            grayscale_weights = grayscale_weights.view(1, 3, 1, 1)
+            rgb_as_grayscale = (real_RGB * grayscale_weights).sum(dim=1, keepdim=True)
+            
+            same_RGB = self.G_IR2RGB(rgb_as_grayscale)
             loss_id_RGB = self.criterion_identity(same_RGB, real_RGB)
             
             # G_RGB2IR should be identity if input is IR

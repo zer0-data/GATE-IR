@@ -66,7 +66,9 @@ class WeatherRouter(nn.Module):
         fog_enhancer: Optional[FogEnhancer] = None,
         rain_remover: Optional[RainRemover] = None,
         fog_config: Optional[Dict] = None,
-        rain_config: Optional[Dict] = None
+        rain_config: Optional[Dict] = None,
+        normalize_input: bool = True,
+        bit_depth: int = 14
     ):
         """
         Initialize WeatherRouter.
@@ -76,8 +78,14 @@ class WeatherRouter(nn.Module):
             rain_remover: Pre-configured RainRemover (created if None)
             fog_config: Config dict for FogEnhancer if creating new
             rain_config: Config dict for RainRemover if creating new
+            normalize_input: Whether to auto-normalize raw input to [0, 1]
+            bit_depth: Bit depth for normalization (14-bit = divide by 16383)
         """
         super().__init__()
+        
+        self.normalize_input = normalize_input
+        self.bit_depth = bit_depth
+        self.max_value = (2 ** bit_depth) - 1  # 16383 for 14-bit
         
         # Initialize preprocessing modules
         self.passthrough = PassThrough()
@@ -101,10 +109,36 @@ class WeatherRouter(nn.Module):
             "rain": self.rain_remover
         })
     
+    def _normalize(
+        self, 
+        images: torch.Tensor, 
+        is_normalized: Optional[bool] = None
+    ) -> Tuple[torch.Tensor, bool]:
+        """
+        Normalize images to [0, 1] range if needed.
+        
+        Returns:
+            normalized_images: Images in [0, 1] range
+            was_normalized: Whether normalization was applied (for rescaling output)
+        """
+        if is_normalized is True:
+            return images, False
+        
+        if is_normalized is False:
+            # Explicitly raw - normalize
+            return images.float() / self.max_value, True
+        
+        # Legacy: infer from max value
+        if self.normalize_input and images.max() > 1.0:
+            return images.float() / images.max(), True
+        
+        return images, False
+    
     def route_single(
         self,
         image: torch.Tensor,
-        class_id: int
+        class_id: int,
+        is_normalized: Optional[bool] = None
     ) -> torch.Tensor:
         """
         Route a single image through appropriate preprocessing.
@@ -112,6 +146,7 @@ class WeatherRouter(nn.Module):
         Args:
             image: Single thermal image (1, H, W) or (H, W)
             class_id: Weather class (0=Clear, 1=Fog, 2=Rain)
+            is_normalized: Whether input is already normalized to [0, 1]
         
         Returns:
             Preprocessed image
@@ -122,13 +157,17 @@ class WeatherRouter(nn.Module):
         elif image.dim() == 3:
             image = image.unsqueeze(0)
         
+        # Normalize if needed
+        image, was_normalized = self._normalize(image, is_normalized)
+        
         # Route to appropriate module
         if class_id == self.CLEAR:
             result = self.passthrough(image)
         elif class_id == self.FOG:
             result = self.fog_enhancer(image)
         elif class_id == self.RAIN:
-            result = self.rain_remover(image)
+            # Pass is_normalized=True since we already normalized
+            result = self.rain_remover(image, is_normalized=True)
         else:
             raise ValueError(f"Unknown class_id: {class_id}")
         
@@ -137,7 +176,8 @@ class WeatherRouter(nn.Module):
     def route_batch_homogeneous(
         self,
         images: torch.Tensor,
-        class_id: int
+        class_id: int,
+        is_normalized: Optional[bool] = None
     ) -> torch.Tensor:
         """
         Route entire batch through same preprocessing (efficient).
@@ -147,16 +187,21 @@ class WeatherRouter(nn.Module):
         Args:
             images: Batch of thermal images (B, 1, H, W)
             class_id: Single weather class for entire batch
+            is_normalized: Whether input is already normalized to [0, 1]
         
         Returns:
             Preprocessed batch
         """
+        # Normalize if needed
+        images, was_normalized = self._normalize(images, is_normalized)
+        
         if class_id == self.CLEAR:
             return self.passthrough(images)
         elif class_id == self.FOG:
             return self.fog_enhancer(images)
         elif class_id == self.RAIN:
-            return self.rain_remover(images)
+            # Pass is_normalized=True since we already normalized above
+            return self.rain_remover(images, is_normalized=True)
         else:
             raise ValueError(f"Unknown class_id: {class_id}")
     

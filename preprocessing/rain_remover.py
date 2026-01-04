@@ -262,11 +262,13 @@ class CLAHE(nn.Module):
     Contrast Limited Adaptive Histogram Equalization.
     
     Provides three implementations:
-    1. OpenCV-based (fast, requires CPU transfer)
-    2. Vectorized LCN (fast, fully GPU, differentiable)
+    1. OpenCV-based (fast, requires CPU transfer, NON-DIFFERENTIABLE)
+    2. Vectorized LCN (fast, fully GPU, DIFFERENTIABLE)
     3. Tiled PyTorch (slow, for reference only)
     
-    For real-time applications, use OpenCV or LCN mode.
+    IMPORTANT: During training (self.training=True), this module automatically
+    uses the differentiable LCN implementation to preserve gradients.
+    OpenCV is only used during inference (self.training=False).
     """
     
     def __init__(
@@ -274,7 +276,8 @@ class CLAHE(nn.Module):
         clip_limit: float = 2.0,
         tile_grid_size: Tuple[int, int] = (8, 8),
         use_opencv: bool = True,
-        lcn_kernel_size: int = 31
+        lcn_kernel_size: int = 31,
+        force_differentiable: bool = False
     ):
         """
         Initialize CLAHE.
@@ -282,34 +285,40 @@ class CLAHE(nn.Module):
         Args:
             clip_limit: Threshold for contrast limiting
             tile_grid_size: Size of grid for adaptive equalization
-            use_opencv: Use OpenCV implementation if available
+            use_opencv: Use OpenCV implementation if available (inference only)
             lcn_kernel_size: Kernel size for LCN fallback
+            force_differentiable: Always use differentiable LCN, even during inference
         """
         super().__init__()
         
         self.clip_limit = clip_limit
         self.tile_grid_size = tile_grid_size
         self.use_opencv = use_opencv and OPENCV_AVAILABLE
+        self.force_differentiable = force_differentiable
         
-        # Fast LCN fallback when OpenCV not available
+        # Fast LCN - used during training for differentiability
         self.lcn = LocalContrastNormalization(
             kernel_size=lcn_kernel_size,
             strength=0.8
         )
         
-        if self.use_opencv:
-            # Create OpenCV CLAHE object
+        if self.use_opencv and not force_differentiable:
+            # Create OpenCV CLAHE object (for inference only)
             self.clahe = cv2.createCLAHE(
                 clipLimit=clip_limit,
                 tileGridSize=tile_grid_size
             )
     
     def _opencv_clahe(self, image: torch.Tensor) -> torch.Tensor:
-        """Apply CLAHE using OpenCV (CPU-based)."""
+        """
+        Apply CLAHE using OpenCV (CPU-based, NON-DIFFERENTIABLE).
+        
+        WARNING: This breaks the computation graph! Only use during inference.
+        """
         device = image.device
         batch_size = image.shape[0]
         
-        # Convert to numpy
+        # Convert to numpy (detaches from computation graph!)
         images_np = image.detach().cpu().numpy()
         results = []
         
@@ -353,16 +362,23 @@ class CLAHE(nn.Module):
         """
         Apply contrast enhancement.
         
+        IMPORTANT: During training, always uses differentiable LCN to preserve
+        gradient flow. OpenCV is only used during inference for speed.
+        
         Args:
             image: Input tensor (B, 1, H, W) normalized to [0, 1]
         
         Returns:
             Contrast-enhanced tensor
         """
+        # Always use differentiable LCN during training
+        if self.training or self.force_differentiable:
+            return self._lcn_clahe(image)
+        
+        # During inference, use OpenCV if available for speed
         if self.use_opencv:
             return self._opencv_clahe(image)
         else:
-            # Use fast LCN instead of slow tiled CLAHE
             return self._lcn_clahe(image)
 
 
@@ -421,50 +437,70 @@ class RainRemover(nn.Module):
         self,
         image: torch.Tensor,
         return_mask: bool = False,
-        return_intermediate: bool = False
+        return_intermediate: bool = False,
+        is_normalized: Optional[bool] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Remove rain from thermal image.
+        
+        IMPORTANT: Input must be normalized to [0, 1] for correct operation.
+        If input is raw (e.g., 14-bit), set is_normalized=False to auto-normalize.
+        The LSRB and clamp operations assume [0, 1] range.
         
         Args:
             image: Input rainy image (B, 1, H, W)
             return_mask: If True, also return predicted rain mask
             return_intermediate: If True, return pre-CLAHE result too
+            is_normalized: Explicit flag for input normalization state.
+                          True=already [0,1], False=raw, None=infer from max value
         
         Returns:
-            clean: Derained and enhanced image
-            rain_mask: (optional) Predicted rain component
-            pre_clahe: (optional) Image after deraining but before CLAHE
+            enhanced_output: Derained and enhanced image
+            predicted_rain_mask: (optional) Predicted rain component
+            derained_output: (optional) Image after deraining but before CLAHE
         """
-        # Ensure proper input range
-        input_max = image.max()
-        if input_max > 1.0:
-            image = image / input_max
-            rescale = True
+        # Store original scale for rescaling output if needed
+        original_max = image.max()
+        needs_rescale = False
+        
+        # Normalize to [0, 1] if needed
+        if is_normalized is True:
+            # Explicitly normalized - use as-is
+            normalized_input = image
+        elif is_normalized is False:
+            # Explicitly raw - normalize
+            normalized_input = image.float() / original_max
+            needs_rescale = True
         else:
-            rescale = False
+            # Legacy: infer from values (deprecated but kept for compatibility)
+            if original_max > 1.0:
+                normalized_input = image / original_max
+                needs_rescale = True
+            else:
+                normalized_input = image
         
         # LSRB: Predict and remove rain
-        derained, rain_mask = self.lsrb(image)
+        # derained_lsrb is in [0, 1] due to clamp in LSRB
+        derained_lsrb, predicted_rain_mask = self.lsrb(normalized_input)
         
         # CLAHE: Restore contrast
         if self.apply_clahe:
-            clean = self.clahe(derained)
+            enhanced_output = self.clahe(derained_lsrb)
         else:
-            clean = derained
+            enhanced_output = derained_lsrb
         
-        # Restore original scale
-        if rescale:
-            clean = clean * input_max
-            derained = derained * input_max
-            rain_mask = rain_mask * input_max
+        # Restore original scale if input was raw
+        if needs_rescale:
+            enhanced_output = enhanced_output * original_max
+            derained_lsrb = derained_lsrb * original_max
+            predicted_rain_mask = predicted_rain_mask * original_max
         
-        # Build output
-        outputs = [clean]
+        # Build output tuple
+        outputs = [enhanced_output]
         if return_mask:
-            outputs.append(rain_mask)
+            outputs.append(predicted_rain_mask)
         if return_intermediate:
-            outputs.append(derained)
+            outputs.append(derained_lsrb)
         
         if len(outputs) == 1:
             return outputs[0]
