@@ -15,9 +15,6 @@ from typing import Optional, List, Tuple, Dict, Union
 import math
 
 
-# ==============================================================================
-# Building Blocks
-# ==============================================================================
 
 class ConvBNSiLU(nn.Module):
     """Standard Convolution + BatchNorm + SiLU activation block."""
@@ -121,9 +118,6 @@ class SPPF(nn.Module):
         return self.cv2(torch.cat([x, y1, y2, y3], dim=1))
 
 
-# ==============================================================================
-# Vision Transformer Components
-# ==============================================================================
 
 class MultiHeadAttention(nn.Module):
     """Multi-Head Self-Attention mechanism."""
@@ -405,9 +399,6 @@ class TransformerNeck(nn.Module):
         return x
 
 
-# ==============================================================================
-# YOLOv8 Components
-# ==============================================================================
 
 class YOLOv8ThermalBackbone(nn.Module):
     """
@@ -754,9 +745,6 @@ class DetectionHead(nn.Module):
             return predictions
 
 
-# ==============================================================================
-# Complete YOLOv8 Thermal Model
-# ==============================================================================
 
 class YOLOv8Thermal(nn.Module):
     """
@@ -960,9 +948,6 @@ class YOLOv8Thermal(nn.Module):
         return fused_features
 
 
-# ==============================================================================
-# Factory Functions
-# ==============================================================================
 
 def yolov8n_thermal(num_classes: int = 80, **kwargs) -> YOLOv8Thermal:
     """YOLOv8-Nano for thermal (fastest, smallest)."""
@@ -1004,9 +989,6 @@ def yolov8l_thermal(num_classes: int = 80, **kwargs) -> YOLOv8Thermal:
     )
 
 
-# ==============================================================================
-# Test Code
-# ==============================================================================
 
 if __name__ == "__main__":
     print("=" * 60)

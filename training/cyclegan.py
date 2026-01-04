@@ -13,9 +13,6 @@ from typing import Optional, Tuple, Dict, List
 import os
 
 
-# ==============================================================================
-# Generator Architecture (ResNet-based)
-# ==============================================================================
 
 class ResidualBlock(nn.Module):
     """Residual block with two convolutions and instance normalization."""
@@ -135,9 +132,6 @@ class Generator(nn.Module):
         return x
 
 
-# ==============================================================================
-# Discriminator Architecture (PatchGAN)
-# ==============================================================================
 
 class Discriminator(nn.Module):
     """
@@ -205,9 +199,6 @@ class Discriminator(nn.Module):
         return self.model(x)
 
 
-# ==============================================================================
-# Image Buffer for Training Stability
-# ==============================================================================
 
 class ImageBuffer:
     """
@@ -243,9 +234,6 @@ class ImageBuffer:
         return torch.cat(result, dim=0)
 
 
-# ==============================================================================
-# CycleGAN Model
-# ==============================================================================
 
 class CycleGAN(nn.Module):
     """
@@ -488,9 +476,6 @@ class CycleGAN(nn.Module):
         return list(self.D_RGB.parameters()) + list(self.D_IR.parameters())
 
 
-# ==============================================================================
-# Training Utilities
-# ==============================================================================
 
 def create_cyclegan_optimizers(
     cyclegan: CycleGAN,
@@ -550,9 +535,6 @@ def convert_ir_to_pseudo_rgb(
     return pseudo_rgb
 
 
-# ==============================================================================
-# Training Script
-# ==============================================================================
 
 class CycleGANTrainer:
     """
@@ -658,9 +640,6 @@ class CycleGANTrainer:
         return checkpoint['epoch']
 
 
-# ==============================================================================
-# Test Code
-# ==============================================================================
 
 if __name__ == "__main__":
     print("=" * 60)

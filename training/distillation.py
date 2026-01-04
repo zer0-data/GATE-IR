@@ -14,10 +14,6 @@ import os
 from tqdm import tqdm
 
 
-# ==============================================================================
-# Feature Alignment Modules
-# ==============================================================================
-
 class ChannelAdapter(nn.Module):
     """
     1x1 Convolution adapter for matching channel dimensions.
@@ -90,10 +86,6 @@ class SpatialAdapter(nn.Module):
         # Channel alignment
         return self.channel_adapter(student_feat)
 
-
-# ==============================================================================
-# Distillation Loss Functions
-# ==============================================================================
 
 class FeatureMimicLoss(nn.Module):
     """
@@ -256,10 +248,6 @@ class ResponseDistillationLoss(nn.Module):
         
         return loss
 
-
-# ==============================================================================
-# Distillation Trainer
-# ==============================================================================
 
 class DistillationTrainer:
     """
@@ -514,9 +502,6 @@ class DistillationTrainer:
         return checkpoint['epoch']
 
 
-# ==============================================================================
-# Training Loop
-# ==============================================================================
 
 def train_distillation(
     trainer: DistillationTrainer,
@@ -612,9 +597,6 @@ def train_distillation(
     print(f"Training complete! Final model saved: {final_path}")
 
 
-# ==============================================================================
-# YOLO Loss Functions
-# ==============================================================================
 
 # Try to import official Ultralytics loss components
 try:
@@ -825,9 +807,6 @@ def create_yolo_loss(
     return DistillationOnlyLoss(num_classes=num_classes)
 
 
-# ==============================================================================
-# Test Code
-# ==============================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
