@@ -11,7 +11,7 @@ Modified YOLOv8-Small architecture with:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Union
 import math
 
 
@@ -674,6 +674,10 @@ class DetectionHead(nn.Module):
     Multi-scale detection head for YOLO.
     
     Processes features at P2, P3, P4, P5 scales.
+    
+    Output Format:
+        - Training: List[Tensor] - concatenated [reg, cls] for Ultralytics loss
+        - Inference: Dict[str, Dict[str, Tensor]] - split predictions per scale
     """
     
     def __init__(
@@ -696,13 +700,15 @@ class DetectionHead(nn.Module):
         
         self.include_p2 = include_p2
         self.num_classes = num_classes
+        self.reg_max = reg_max
+        
+        # Store scale names in order (important for consistent output order)
+        self.scale_names = ['P2', 'P3', 'P4', 'P5'] if include_p2 else ['P3', 'P4', 'P5']
         
         # Create heads for each scale
-        scales = ['P2', 'P3', 'P4', 'P5'] if include_p2 else ['P3', 'P4', 'P5']
-        
         self.heads = nn.ModuleDict({
             scale: self._make_head(in_channels[scale], num_classes, reg_max)
-            for scale in scales
+            for scale in self.scale_names
         })
     
     def _make_head(
@@ -717,7 +723,7 @@ class DetectionHead(nn.Module):
     def forward(
         self,
         features: Dict[str, torch.Tensor]
-    ) -> Dict[str, Dict[str, torch.Tensor]]:
+    ) -> Union[List[torch.Tensor], Dict[str, Dict[str, torch.Tensor]]]:
         """
         Generate multi-scale predictions.
         
@@ -725,14 +731,27 @@ class DetectionHead(nn.Module):
             features: Multi-scale feature maps
         
         Returns:
-            Predictions at each scale
+            Training mode: List of concatenated tensors [reg, cls] per scale
+                          for Ultralytics v8DetectionLoss compatibility
+            Inference mode: Dict of split predictions per scale
         """
-        predictions = {}
-        
-        for scale, head in self.heads.items():
-            predictions[scale] = head(features[scale])
-        
-        return predictions
+        if self.training:
+            # Training: Return list of concatenated tensors for Ultralytics loss
+            # Order: [P2, P3, P4, P5] or [P3, P4, P5]
+            outputs = []
+            for scale in self.scale_names:
+                pred = self.heads[scale](features[scale])
+                # Concatenate reg (64 channels) and cls (num_classes channels)
+                # Shape: (B, 64 + num_classes, H, W)
+                combined = torch.cat([pred['reg'], pred['cls']], dim=1)
+                outputs.append(combined)
+            return outputs
+        else:
+            # Inference: Return dictionary of split predictions
+            predictions = {}
+            for scale in self.scale_names:
+                predictions[scale] = self.heads[scale](features[scale])
+            return predictions
 
 
 # ==============================================================================
@@ -852,19 +871,18 @@ class YOLOv8Thermal(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        return_features: bool = False,
-        ultralytics_format: bool = False
-    ) -> Dict:
+        return_features: bool = False
+    ) -> Union[List[torch.Tensor], Dict]:
         """
         Forward pass through complete model.
         
         Args:
             x: Input tensor (B, 1, H, W)
-            return_features: Also return intermediate features
-            ultralytics_format: Return in Ultralytics-compatible format for loss
+            return_features: Also return intermediate features (inference only)
         
         Returns:
-            Dictionary containing predictions (and optionally features)
+            Training mode: List[Tensor] - concatenated predictions for Ultralytics loss
+            Inference mode: Dict with 'predictions' key containing per-scale outputs
         """
         # Backbone
         features = self.backbone(x)
@@ -877,12 +895,14 @@ class YOLOv8Thermal(nn.Module):
         fused_features = self.neck(features)
         
         # Detection heads
+        # Returns List[Tensor] during training, Dict during inference
         predictions = self.head(fused_features)
         
-        # Convert to Ultralytics format if requested (for loss computation)
-        if ultralytics_format:
-            return self._to_ultralytics_format(predictions)
+        # During training, return list directly for Ultralytics loss
+        if self.training:
+            return predictions  # List[Tensor]
         
+        # During inference, return dict format
         output = {'predictions': predictions}
         
         if return_features:
