@@ -1,0 +1,85 @@
+# YOLOv8 Thermal Configuration
+# Modified for single-channel thermal input with P2 head and ViT neck
+
+# Model parameters
+nc: 80  # number of classes (override in training)
+depth_multiple: 0.33  # YOLOv8s depth
+width_multiple: 0.50  # YOLOv8s width
+ch: 1  # Single-channel thermal input
+
+# Backbone
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2  (320x320 for 640 input)
+  - [-1, 1, Conv, [128, 3, 2]]  # 1-P2/4  (160x160)
+  - [-1, 3, C2f, [128, True]]
+  - [-1, 1, Conv, [256, 3, 2]]  # 3-P3/8  (80x80)
+  - [-1, 6, C2f, [256, True]]
+  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16  (40x40)
+  - [-1, 6, C2f, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32  (20x20)
+  - [-1, 3, C2f, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]]  # 9
+
+# Head with P2 detection
+head:
+  # Top-down FPN
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 6], 1, Concat, [1]]  # cat P5 + P4
+  - [-1, 3, C2f, [512]]  # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 4], 1, Concat, [1]]  # cat P4 + P3
+  - [-1, 3, C2f, [256]]  # 15 (P3/8)
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 2], 1, Concat, [1]]  # cat P3 + P2
+  - [-1, 3, C2f, [128]]  # 18 (P2/4 - 160x160)
+
+  # Bottom-up PAN
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [[-1, 15], 1, Concat, [1]]  # cat P2_down + P3
+  - [-1, 3, C2f, [256]]  # 21 (P3/8)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]  # cat P3_down + P4
+  - [-1, 3, C2f, [512]]  # 24 (P4/16)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 9], 1, Concat, [1]]  # cat P4_down + P5
+  - [-1, 3, C2f, [1024]]  # 27 (P5/32)
+
+  # Detection layers (P2, P3, P4, P5)
+  - [[18, 21, 24, 27], 1, Detect, [nc]]  # Detect(P2, P3, P4, P5)
+
+# Transformer Neck Configuration (custom module)
+# Insert between backbone output and head
+transformer_neck:
+  enabled: true
+  in_channels: 512  # Applied to P4
+  num_heads: 8
+  num_blocks: 1
+  mlp_ratio: 4.0
+  drop: 0.0
+
+# Anchor-free detection settings
+anchors: null  # YOLOv8 is anchor-free
+
+# Training settings (defaults, override as needed)
+train:
+  imgsz: 640
+  batch: 16
+  epochs: 300
+  
+# Data augmentation for thermal
+augment:
+  hsv_h: 0.0  # No hue augment for thermal
+  hsv_s: 0.0  # No saturation for thermal
+  hsv_v: 0.4  # Value/brightness augment
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  fliplr: 0.5
+  flipud: 0.0
+  mosaic: 1.0
+  mixup: 0.0

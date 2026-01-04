@@ -1,0 +1,25 @@
+# GATE-IR: Gated Adaptive Thermal Enhancement for IR Detection
+# Python 3.8+ required
+
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Object Detection
+ultralytics>=8.0.0
+
+# Image Processing
+opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Training & Visualization
+tensorboard>=2.13.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+Pillow>=9.5.0
+
+# Utilities
+pyyaml>=6.0
+einops>=0.6.0  # For transformer operations
