@@ -631,24 +631,26 @@ class UltralyticsYOLOLoss(nn.Module):
     
     THIS IS THE ONLY RECOMMENDED LOSS FOR FULL DETECTION TRAINING.
     
-    Includes all proper loss components with correct DFL decoding:
+    This wrapper handles the compatibility between our custom YOLOv8Thermal
+    model and the Ultralytics v8DetectionLoss which expects specific attributes:
+    - model.stride: Tensor of strides for each detection scale
+    - model.nc: Number of classes
+    - model.reg_max: DFL regression maximum
+    - model.args: Namespace with box, cls, dfl weights
+    
+    The loss includes:
     - Box regression with CIoU loss (after DFL decoding)
     - Classification with BCE + Focal Loss
     - DFL (Distribution Focal Loss) for precise localization
     - Task-Aligned Assigner for target matching
-    
-    Why use this:
-    - YOLOv8 outputs DFL distributions (64 channels for 4 coords × 16 bins)
-    - These must be decoded to scalar coordinates before CIoU can be computed
-    - The official loss handles all this complexity correctly
     """
     
     def __init__(self, model, num_classes: int = 80):
         """
-        Initialize with Ultralytics model for proper loss computation.
+        Initialize with model for proper loss computation.
         
         Args:
-            model: Ultralytics YOLO model instance
+            model: YOLOv8Thermal model instance (must have stride, nc, reg_max, args)
             num_classes: Number of detection classes
         """
         super().__init__()
@@ -661,21 +663,66 @@ class UltralyticsYOLOLoss(nn.Module):
             )
         
         self.num_classes = num_classes
+        self.model = model
         
-        # Create the official loss function
-        self.loss_fn = v8DetectionLoss(model)
+        # Verify model has required attributes
+        required_attrs = ['stride', 'nc', 'reg_max', 'args']
+        missing = [attr for attr in required_attrs if not hasattr(model, attr)]
+        if missing:
+            raise AttributeError(
+                f"Model is missing required attributes for Ultralytics loss: {missing}\n"
+                f"Ensure YOLOv8Thermal model has: stride, nc, reg_max, args"
+            )
+        
+        # Create a wrapper that v8DetectionLoss expects
+        # v8DetectionLoss accesses model.model[-1] for detection head info
+        class DetectWrapper:
+            """Mimics Ultralytics Detect module interface."""
+            def __init__(self, parent_model):
+                self.nc = parent_model.nc
+                self.reg_max = parent_model.reg_max
+                self.no = parent_model.reg_max * 4 + parent_model.nc  # Output channels per anchor
+                self.stride = parent_model.stride
+        
+        class ModelWrapper:
+            """Mimics Ultralytics Model interface for v8DetectionLoss."""
+            def __init__(self, parent_model):
+                self.stride = parent_model.stride
+                self.nc = parent_model.nc
+                self.reg_max = parent_model.reg_max
+                self.args = parent_model.args
+                # v8DetectionLoss accesses model.model[-1]
+                self.model = [DetectWrapper(parent_model)]
+            
+            def __getitem__(self, idx):
+                return self.model[idx]
+        
+        # Create the wrapper and initialize Ultralytics loss
+        self.model_wrapper = ModelWrapper(model)
+        self.loss_fn = v8DetectionLoss(self.model_wrapper)
     
     def forward(self, predictions, targets):
         """
         Compute official YOLO loss with proper DFL decoding.
         
         Args:
-            predictions: Model predictions (raw from detection head)
-            targets: Ground truth in Ultralytics batch format
+            predictions: List of tensors from model._to_ultralytics_format()
+                         or raw dict (will be converted)
+            targets: Ground truth batch dict with 'batch_idx', 'cls', 'bboxes' keys
         
         Returns:
-            Total loss (box + cls + dfl)
+            Tuple of (total_loss, loss_components) from Ultralytics loss
         """
+        # Convert dict predictions to Ultralytics format if needed
+        if isinstance(predictions, dict):
+            if hasattr(self.model, '_to_ultralytics_format'):
+                predictions = self.model._to_ultralytics_format(predictions.get('predictions', predictions))
+            else:
+                raise ValueError(
+                    "Predictions are in dict format but model doesn't have "
+                    "_to_ultralytics_format method. Use model(x, ultralytics_format=True)"
+                )
+        
         return self.loss_fn(predictions, targets)
 
 

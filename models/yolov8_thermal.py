@@ -799,6 +799,26 @@ class YOLOv8Thermal(nn.Module):
         self.include_p2 = include_p2
         self.use_transformer_neck = use_transformer_neck
         
+        # Ultralytics compatibility attributes (required for v8DetectionLoss)
+        self.nc = num_classes  # Number of classes
+        self.reg_max = 16  # DFL regression max
+        
+        # Strides for each detection scale
+        if include_p2:
+            self.stride = torch.tensor([4, 8, 16, 32])  # P2, P3, P4, P5
+            self._scale_names = ['P2', 'P3', 'P4', 'P5']
+        else:
+            self.stride = torch.tensor([8, 16, 32])  # P3, P4, P5
+            self._scale_names = ['P3', 'P4', 'P5']
+        
+        # Args namespace for Ultralytics loss compatibility
+        class Args:
+            def __init__(self):
+                self.box = 7.5  # Box loss weight
+                self.cls = 0.5  # Classification loss weight
+                self.dfl = 1.5  # DFL loss weight
+        self.args = Args()
+        
         # Backbone
         self.backbone = YOLOv8ThermalBackbone(
             in_channels=in_channels,
@@ -832,7 +852,8 @@ class YOLOv8Thermal(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        return_features: bool = False
+        return_features: bool = False,
+        ultralytics_format: bool = False
     ) -> Dict:
         """
         Forward pass through complete model.
@@ -840,6 +861,7 @@ class YOLOv8Thermal(nn.Module):
         Args:
             x: Input tensor (B, 1, H, W)
             return_features: Also return intermediate features
+            ultralytics_format: Return in Ultralytics-compatible format for loss
         
         Returns:
             Dictionary containing predictions (and optionally features)
@@ -857,6 +879,10 @@ class YOLOv8Thermal(nn.Module):
         # Detection heads
         predictions = self.head(fused_features)
         
+        # Convert to Ultralytics format if requested (for loss computation)
+        if ultralytics_format:
+            return self._to_ultralytics_format(predictions)
+        
         output = {'predictions': predictions}
         
         if return_features:
@@ -864,6 +890,43 @@ class YOLOv8Thermal(nn.Module):
             output['fused_features'] = fused_features
         
         return output
+    
+    def _to_ultralytics_format(
+        self, 
+        predictions: Dict[str, Dict[str, torch.Tensor]]
+    ) -> List[torch.Tensor]:
+        """
+        Convert predictions to Ultralytics v8DetectionLoss format.
+        
+        Ultralytics expects a list of tensors, one per scale, with shape:
+        (B, reg_max*4 + num_classes, H, W)
+        
+        The channels are ordered as: [reg (64), cls (nc)]
+        
+        Args:
+            predictions: Dict with scale keys ('P2', 'P3', etc.)
+        
+        Returns:
+            List of concatenated tensors for each scale
+        """
+        outputs = []
+        
+        for scale_name in self._scale_names:
+            if scale_name not in predictions:
+                continue
+                
+            pred = predictions[scale_name]
+            
+            # Concatenate reg and cls: (B, 64 + nc, H, W)
+            # Note: Ultralytics expects reg first, then cls
+            combined = torch.cat([
+                pred['reg'],  # (B, 64, H, W) - DFL distributions
+                pred['cls']   # (B, nc, H, W) - class logits
+            ], dim=1)
+            
+            outputs.append(combined)
+        
+        return outputs
     
     def get_feature_maps(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Extract intermediate feature maps (for knowledge distillation)."""
