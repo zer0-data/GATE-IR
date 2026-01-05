@@ -152,6 +152,7 @@ The following ablation experiments are proposed to validate design decisions and
 | A1 | **Pseudo-RGB at Test Time** | Convert IR→Pseudo-RGB via CycleGAN before detection, train student on RGB | Higher accuracy but +50-100ms latency | Tests if cross-modal features help |
 | A2 | **No Weather Gating** | Remove WeatherGate, apply all preprocessing | Baseline without gating overhead | May over-process clear images |
 | A3 | **Joint Preprocessing** | Apply fog+rain preprocessing to all images | Simpler pipeline | Risk of artifacts on clear images |
+| A4 | **Our Pipeline** | Do selective processing based on our classification | Simpler pipeline | Risk of artifacts on clear images |
 
 ### B. Gating Strategy Ablations
 
